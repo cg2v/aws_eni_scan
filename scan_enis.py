@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+# pylint: disable=broad-exception-caught
 
 import argparse
 import ipaddress
@@ -17,9 +18,10 @@ from aws_org_scan import (
     discover_enabled_regions,
     format_aws_error,
     list_active_accounts,
+    list_active_accounts_for_ou_scope,
     make_client,
 )
-from eni_search import search_network_interfaces
+from eni_search import search_elastic_ips, search_network_interfaces
 from reporting import print_summary, write_json_report
 
 
@@ -40,7 +42,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     parser.add_argument(
         "--role-name",
-        default="OrganizationAccountAccessRole",
+        default="Administrators",
         help="Role name to assume in each member account",
     )
     parser.add_argument("--external-id", help="Optional external ID for AssumeRole")
@@ -52,6 +54,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--exclude-accounts",
         help="Comma-separated account IDs to exclude",
+    )
+    parser.add_argument(
+        "--include-ou",
+        help="Comma-separated OU IDs (or root IDs) to scope account selection",
     )
 
     parser.add_argument(
@@ -90,6 +96,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--fail-on-partial",
         action="store_true",
         help="Exit with code 1 if any account/region errors occurred",
+    )
+    parser.add_argument(
+        "--include-elastic-ip",
+        action="store_true",
+        help="Also scan Elastic IP addresses and include matches in the report",
     )
     parser.add_argument("--verbose", action="store_true")
 
@@ -155,6 +166,7 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
     include_accounts = parse_csv_arg(args.include_accounts)
     exclude_accounts = parse_csv_arg(args.exclude_accounts)
+    include_ou = sorted(parse_csv_arg(args.include_ou))
     exclude_regions = parse_csv_arg(args.exclude_regions)
 
     explicit_regions: list[str] | None
@@ -166,13 +178,22 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise SystemExit("--regions must be 'all-enabled' or a non-empty CSV list")
 
     org_client = make_client("organizations", timeout_seconds=args.request_timeout_seconds)
-    all_accounts = list_active_accounts(org_client, max_retries=args.max_retries)
-    target_accounts = build_targets(all_accounts, include_accounts, exclude_accounts)
+    if include_ou:
+        scoped_accounts = list_active_accounts_for_ou_scope(
+            org_client,
+            ou_or_root_ids=include_ou,
+            max_retries=args.max_retries,
+        )
+    else:
+        scoped_accounts = list_active_accounts(org_client, max_retries=args.max_retries)
+
+    target_accounts = build_targets(scoped_accounts, include_accounts, exclude_accounts)
 
     if not target_accounts:
         raise SystemExit("No ACTIVE target accounts after filters")
 
     matches: list[dict[str, Any]] = []
+    elastic_ip_matches: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
     coverage = {
@@ -188,7 +209,8 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         credentials: dict[str, str],
         region: str,
         seen_at: str,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, bool]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], bool]:
+        region_errors: list[dict[str, Any]] = []
         try:
             ec2_client = make_client(
                 "ec2",
@@ -208,24 +230,58 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 seen_at=seen_at,
                 max_retries=args.max_retries,
             )
-            return region_matches, None, True
         except Exception as exc:  # noqa: BLE001
             code, message = format_aws_error(exc)
-            error_item = {
-                "scope": "region",
-                "account_id": account.account_id,
-                "region": region,
-                "stage": "describe_enis",
-                "error_code": code,
-                "error_message": message,
-                "retry_count": args.max_retries,
-                "terminal": True,
-            }
-            return [], error_item, False
+            region_errors.append(
+                {
+                    "scope": "region",
+                    "account_id": account.account_id,
+                    "region": region,
+                    "stage": "describe_enis",
+                    "error_code": code,
+                    "error_message": message,
+                    "retry_count": args.max_retries,
+                    "terminal": True,
+                }
+            )
+            return [], [], region_errors, False
+
+        region_eip_matches: list[dict[str, Any]] = []
+        if args.include_elastic_ip:
+            try:
+                region_eip_matches = search_elastic_ips(
+                    ec2_client=ec2_client,
+                    account_id=account.account_id,
+                    account_name=account.account_name,
+                    region=region,
+                    query_mode=query_mode,
+                    query_value=query_value,
+                    match_mode=args.match_mode,
+                    case_sensitive=args.case_sensitive,
+                    seen_at=seen_at,
+                    max_retries=args.max_retries,
+                )
+            except Exception as exc:  # noqa: BLE001
+                code, message = format_aws_error(exc)
+                region_errors.append(
+                    {
+                        "scope": "region",
+                        "account_id": account.account_id,
+                        "region": region,
+                        "stage": "describe_addresses",
+                        "error_code": code,
+                        "error_message": message,
+                        "retry_count": args.max_retries,
+                        "terminal": True,
+                    }
+                )
+
+        return region_matches, region_eip_matches, region_errors, True
 
     def scan_account(account: AccountInfo) -> dict[str, Any]:
         account_result = {
             "matches": [],
+            "elastic_ip_matches": [],
             "errors": [],
             "target_regions": 0,
             "scanned_regions": 0,
@@ -245,18 +301,17 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         except Exception as exc:  # noqa: BLE001
             code, message = format_aws_error(exc)
-            account_result["errors"].append(
-                {
-                    "scope": "account",
-                    "account_id": account.account_id,
-                    "region": None,
-                    "stage": "assume_role",
-                    "error_code": code,
-                    "error_message": message,
-                    "retry_count": args.max_retries,
-                    "terminal": True,
-                }
-            )
+            error_item = {
+                "scope": "account",
+                "account_id": account.account_id,
+                "region": None,
+                "stage": "assume_role",
+                "error_code": code,
+                "error_message": message,
+                "retry_count": args.max_retries,
+                "terminal": True,
+            }
+            account_result["errors"].append(error_item)
             return account_result
 
         if explicit_regions is None:
@@ -303,12 +358,12 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 for region in scan_regions
             ]
             for future in as_completed(futures):
-                region_matches, region_error, ok = future.result()
+                region_matches, region_eip_matches, region_errors, ok = future.result()
                 if ok:
                     account_result["scanned_regions"] += 1
                     account_result["matches"].extend(region_matches)
-                elif region_error:
-                    account_result["errors"].append(region_error)
+                    account_result["elastic_ip_matches"].extend(region_eip_matches)
+                account_result["errors"].extend(region_errors)
 
         account_result["account_scanned"] = account_result["scanned_regions"] > 0
         return account_result
@@ -338,6 +393,7 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 continue
 
             matches.extend(result["matches"])
+            elastic_ip_matches.extend(result["elastic_ip_matches"])
             errors.extend(result["errors"])
             coverage["target_account_regions"] += result["target_regions"]
             coverage["scanned_account_regions"] += result["scanned_regions"]
@@ -351,6 +407,7 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     f" {account.account_id}"
                     f" regions={result['scanned_regions']}/{result['target_regions']}"
                     f" matches={len(result['matches'])}"
+                    f" eip_matches={len(result['elastic_ip_matches'])}"
                     f" errors={len(result['errors'])}"
                 )
 
@@ -372,11 +429,14 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "value": query_value,
             "match_mode": args.match_mode,
             "case_sensitive": bool(args.case_sensitive),
+            "include_ou": include_ou,
+            "include_elastic_ip": bool(args.include_elastic_ip),
             "started_at": started_at,
             "finished_at": finished_at,
         },
         "coverage": coverage,
         "matches": matches,
+        "elastic_ip_matches": elastic_ip_matches,
         "errors": errors,
         "status": status,
     }
@@ -392,16 +452,13 @@ def main(argv: list[str]) -> int:
         print_summary(report, args.output_file)
         return exit_code
     except ClientError as exc:
-        code, message = exc.response.get("Error", {}).get("Code", "ClientError"), exc.response.get(
-            "Error", {}
-        ).get("Message", str(exc))
+        code = exc.response.get("Error", {}).get("Code", "ClientError")
+        message = exc.response.get("Error", {}).get("Message", str(exc))
         print(f"fatal AWS client error: {code}: {message}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 130
-    except SystemExit:
-        raise
     except Exception as exc:  # noqa: BLE001
         print(f"fatal error: {exc}", file=sys.stderr)
         return 1

@@ -24,11 +24,14 @@ def print_summary(report: dict[str, Any], output_file: str) -> None:
     coverage = report["coverage"]
     errors = report["errors"]
     matches = report["matches"]
+    elastic_ip_matches = report.get("elastic_ip_matches", [])
 
     print("ENI scan summary")
     print(f"query mode:         {query['mode']}")
     print(f"query value:        {query['value']}")
     print(f"match mode:         {query['match_mode']}")
+    print(f"OU scope count:     {len(query.get('include_ou', []))}")
+    print(f"scan elastic IPs:   {bool(query.get('include_elastic_ip', False))}")
     print(f"target accounts:    {coverage['target_accounts']}")
     print(f"scanned accounts:   {coverage['scanned_accounts']}")
     print(
@@ -42,6 +45,7 @@ def print_summary(report: dict[str, Any], output_file: str) -> None:
     )
     print(f"skipped regions:    {coverage['skipped_account_regions']}")
     print(f"matches:            {len(matches)}")
+    print(f"elastic IP matches: {len(elastic_ip_matches)}")
     print(f"errors:             {len(errors)}")
     print(f"status:             {report['status']}")
     print(f"output file:        {output_file}")

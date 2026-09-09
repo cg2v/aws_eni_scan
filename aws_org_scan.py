@@ -1,4 +1,5 @@
 from __future__ import annotations
+# pylint: disable=broad-exception-caught
 
 import random
 import time
@@ -7,7 +8,7 @@ from typing import Any, Callable
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 
 
 RETRIABLE_ERROR_CODES = {
@@ -73,7 +74,7 @@ def call_with_retries(
     for attempt in range(max_retries + 1):
         try:
             return fn(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001
+        except (ClientError, EndpointConnectionError, BotoCoreError) as exc:
             last_exc = exc
             if attempt >= max_retries or not is_retriable_exception(exc):
                 raise
@@ -102,6 +103,73 @@ def list_active_accounts(org_client: Any, max_retries: int) -> list[AccountInfo]
                 )
 
     return accounts
+
+
+def list_child_ous(org_client: Any, parent_id: str, max_retries: int) -> list[str]:
+    paginator = org_client.get_paginator("list_organizational_units_for_parent")
+    page_iterator = call_with_retries(
+        paginator.paginate,
+        ParentId=parent_id,
+        max_retries=max_retries,
+    )
+
+    ou_ids: list[str] = []
+    for page in page_iterator:
+        for ou in page.get("OrganizationalUnits", []):
+            ou_id = ou.get("Id")
+            if ou_id:
+                ou_ids.append(ou_id)
+    return ou_ids
+
+
+def list_active_accounts_for_parent(
+    org_client: Any,
+    parent_id: str,
+    max_retries: int,
+) -> list[AccountInfo]:
+    paginator = org_client.get_paginator("list_accounts_for_parent")
+    page_iterator = call_with_retries(
+        paginator.paginate,
+        ParentId=parent_id,
+        max_retries=max_retries,
+    )
+
+    accounts: list[AccountInfo] = []
+    for page in page_iterator:
+        for account in page.get("Accounts", []):
+            if account.get("Status") == "ACTIVE":
+                accounts.append(
+                    AccountInfo(
+                        account_id=account["Id"],
+                        account_name=account.get("Name", ""),
+                    )
+                )
+    return accounts
+
+
+def list_active_accounts_for_ou_scope(
+    org_client: Any,
+    ou_or_root_ids: list[str],
+    max_retries: int,
+) -> list[AccountInfo]:
+    visited_parents: set[str] = set()
+    dedup_accounts: dict[str, AccountInfo] = {}
+
+    def walk_parent(parent_id: str) -> None:
+        if parent_id in visited_parents:
+            return
+        visited_parents.add(parent_id)
+
+        for account in list_active_accounts_for_parent(org_client, parent_id, max_retries):
+            dedup_accounts[account.account_id] = account
+
+        for child_ou_id in list_child_ous(org_client, parent_id, max_retries):
+            walk_parent(child_ou_id)
+
+    for parent_id in ou_or_root_ids:
+        walk_parent(parent_id)
+
+    return sorted(dedup_accounts.values(), key=lambda a: a.account_id)
 
 
 def assume_role_credentials(

@@ -161,3 +161,80 @@ def search_network_interfaces(
                 )
 
     return matches
+
+
+def normalize_eip_match(
+    eip: dict[str, Any],
+    account_id: str,
+    account_name: str,
+    region: str,
+    seen_at: str,
+) -> dict[str, Any]:
+    tag_name = ""
+    for tag in eip.get("Tags", []):
+        if tag.get("Key") == "Name":
+            tag_name = tag.get("Value", "")
+            break
+
+    return {
+        "account_id": account_id,
+        "account_name": account_name,
+        "region": region,
+        "allocation_id": eip.get("AllocationId", ""),
+        "association_id": eip.get("AssociationId", ""),
+        "public_ip": eip.get("PublicIp", ""),
+        "network_interface_id": eip.get("NetworkInterfaceId", ""),
+        "instance_id": eip.get("InstanceId", ""),
+        "domain": eip.get("Domain", ""),
+        "private_ip_address": eip.get("PrivateIpAddress", ""),
+        "tag_name": tag_name,
+        "seen_at": seen_at,
+    }
+
+
+def search_elastic_ips(
+    ec2_client: Any,
+    account_id: str,
+    account_name: str,
+    region: str,
+    query_mode: str,
+    query_value: str,
+    match_mode: str,
+    case_sensitive: bool,
+    seen_at: str,
+    max_retries: int,
+) -> list[dict[str, Any]]:
+    request: dict[str, Any] = {}
+    if query_mode == "public_ip":
+        request["PublicIps"] = [query_value]
+
+    response = call_with_retries(
+        ec2_client.describe_addresses,
+        max_retries=max_retries,
+        **request,
+    )
+
+    matches: list[dict[str, Any]] = []
+    for eip in response.get("Addresses", []):
+        if query_mode == "public_ip":
+            is_match = eip.get("PublicIp", "") == query_value
+        else:
+            tag_name = ""
+            for tag in eip.get("Tags", []):
+                if tag.get("Key") == "Name":
+                    tag_name = tag.get("Value", "")
+                    break
+            is_match = text_matches(tag_name, query_value, match_mode, case_sensitive)
+
+        if is_match:
+            matches.append(
+                normalize_eip_match(
+                    eip=eip,
+                    account_id=account_id,
+                    account_name=account_name,
+                    region=region,
+                    seen_at=seen_at,
+                )
+            )
+
+    return matches
