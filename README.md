@@ -7,7 +7,7 @@ This tool does not use AWS Resource Explorer.
 ## What it does
 
 1. Lists ACTIVE accounts using Organizations in the management account.
-2. Assumes a role in each target account (default role name: `Administrators`).
+2. Uses source credentials directly when the target account is the same as the caller account; otherwise assumes a role in each target account (default role name: `OrganizationAccountAccessRole`).
 3. Discovers each account's enabled regions (or uses explicit region list).
 4. Searches ENIs in each region via `DescribeNetworkInterfaces`.
 5. Optionally searches Elastic IPs in each region via `DescribeAddresses`.
@@ -47,7 +47,7 @@ Exactly one query mode is required:
 python scan_enis.py \
   --public-ip 203.0.113.10 \
   --include-elastic-ip \
-  --role-name Administrators \
+  --role-name OrganizationAccountAccessRole \
   --output-file reports/eni_public_ip.json
 ```
 
@@ -57,7 +57,7 @@ python scan_enis.py \
 python scan_enis.py \
   --eni-name my-eni-name \
   --match-mode exact \
-  --role-name Administrators \
+  --role-name OrganizationAccountAccessRole \
   --output-file reports/eni_name.json
 ```
 
@@ -67,7 +67,7 @@ python scan_enis.py \
 python scan_enis.py \
   --description "Interface for NAT Gateway" \
   --match-mode contains \
-  --role-name Administrators \
+  --role-name OrganizationAccountAccessRole \
   --output-file reports/eni_desc.json
 ```
 
@@ -78,7 +78,7 @@ python scan_enis.py \
   --public-ip 203.0.113.10 \
   --include-ou ou-abcd-12345678,ou-abcd-87654321 \
   --include-elastic-ip \
-  --role-name Administrators \
+  --role-name OrganizationAccountAccessRole \
   --output-file reports/eni_ou_scope.json
 ```
 

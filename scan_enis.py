@@ -17,6 +17,7 @@ from aws_org_scan import (
     assume_role_credentials,
     discover_enabled_regions,
     format_aws_error,
+    get_caller_account_id,
     list_active_accounts,
     list_active_accounts_for_ou_scope,
     make_client,
@@ -42,7 +43,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     parser.add_argument(
         "--role-name",
-        default="Administrators",
+        default="OrganizationAccountAccessRole",
         help="Role name to assume in each member account",
     )
     parser.add_argument("--external-id", help="Optional external ID for AssumeRole")
@@ -192,6 +193,11 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if not target_accounts:
         raise SystemExit("No ACTIVE target accounts after filters")
 
+    source_account_id = get_caller_account_id(
+        timeout_seconds=args.request_timeout_seconds,
+        max_retries=args.max_retries,
+    )
+
     matches: list[dict[str, Any]] = []
     elastic_ip_matches: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -206,7 +212,7 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
     def scan_region(
         account: AccountInfo,
-        credentials: dict[str, str],
+        credentials: dict[str, str] | None,
         region: str,
         seen_at: str,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -290,29 +296,31 @@ def run_scan(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         }
 
         session_name = f"eni-scan-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-        try:
-            credentials = assume_role_credentials(
-                account_id=account.account_id,
-                role_name=args.role_name,
-                external_id=args.external_id,
-                session_name=session_name,
-                timeout_seconds=args.request_timeout_seconds,
-                max_retries=args.max_retries,
-            )
-        except Exception as exc:  # noqa: BLE001
-            code, message = format_aws_error(exc)
-            error_item = {
-                "scope": "account",
-                "account_id": account.account_id,
-                "region": None,
-                "stage": "assume_role",
-                "error_code": code,
-                "error_message": message,
-                "retry_count": args.max_retries,
-                "terminal": True,
-            }
-            account_result["errors"].append(error_item)
-            return account_result
+        credentials: dict[str, str] | None = None
+        if account.account_id != source_account_id:
+            try:
+                credentials = assume_role_credentials(
+                    account_id=account.account_id,
+                    role_name=args.role_name,
+                    external_id=args.external_id,
+                    session_name=session_name,
+                    timeout_seconds=args.request_timeout_seconds,
+                    max_retries=args.max_retries,
+                )
+            except Exception as exc:  # noqa: BLE001
+                code, message = format_aws_error(exc)
+                error_item = {
+                    "scope": "account",
+                    "account_id": account.account_id,
+                    "region": None,
+                    "stage": "assume_role",
+                    "error_code": code,
+                    "error_message": message,
+                    "retry_count": args.max_retries,
+                    "terminal": True,
+                }
+                account_result["errors"].append(error_item)
+                return account_result
 
         if explicit_regions is None:
             try:

@@ -198,8 +198,20 @@ def assume_role_credentials(
     return response["Credentials"]
 
 
+def get_caller_account_id(
+    timeout_seconds: int,
+    max_retries: int,
+) -> str:
+    sts_client = make_client("sts", timeout_seconds=timeout_seconds)
+    response = call_with_retries(
+        sts_client.get_caller_identity,
+        max_retries=max_retries,
+    )
+    return response["Account"]
+
+
 def discover_enabled_regions(
-    credentials: dict[str, str],
+    credentials: dict[str, str] | None,
     timeout_seconds: int,
     max_retries: int,
 ) -> list[str]:
